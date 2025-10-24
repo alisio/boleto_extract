@@ -1,0 +1,13 @@
+nome_pagamento,codigos
+conta_luz,"[""LUZ"",""ENERGIA"",""COMPANHIA""]"
+conta_agua,"[""AGUA"",""SANEA"",""TRATAMENTO""]"
+cartao_credito,"[""CARTAO"",""CREDITO"",""BANCO""]"
+condominio,"[""CONDOMINIO"",""MENSAL""]"
+internet,"[""INTERNET"",""PROVEDOR""]"
+telefone,"[""TELEFONE"",""CELULAR"",""MOVEL""]"
+seguro,"[""SEGURO"",""APOLICE""]"
+imposto,"[""IMPOSTO"",""TRIBUTOS""]"
+educacao,"[""ESCOLA"",""CURSO"",""EDUCACAO""]"
+transporte,"[""TRANSPORTE"",""BILHETE""]"
+fintech,"[""FINTECH"",""PAGAMENTO""]"
+recarga,"[""RECARGA"",""CELULAR""]"
