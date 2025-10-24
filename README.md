@@ -2,6 +2,18 @@
 
 Este script processa arquivos de comprovantes de pagamento (PDF, JPEG, PNG), extrai informações relevantes usando OCR e um modelo de linguagem natural (LLM), classifica os boletos e renomeia os arquivos com base na data do pagamento, valor pago e classificação.
 
+## AVISO: Dados Sensíveis
+
+ATENCAO: Este script processa documentos financeiros que podem conter informações pessoais sensíveis (CPF, CNPJ, dados bancários, valores). Tome os seguintes cuidados:
+
+- O conteúdo completo dos comprovantes é enviado ao modelo LLM configurado
+- Use preferencialmente modelos locais em vez de serviços em nuvem para evitar vazamento de dados
+- Os logs podem conter informações extraídas dos comprovantes
+- Nomes de arquivos renomeados incluem data e valor do pagamento
+- Certifique-se de ter autorização para processar os documentos
+- Considere as implicações da LGPD/GDPR ao processar dados de terceiros
+- Revise as políticas de privacidade do provedor LLM antes de usar serviços externos
+
 ## Funcionalidades
 
 - Extração de texto de PDFs e imagens usando OCR (Tesseract)
@@ -59,6 +71,8 @@ O script suporta configuração via variáveis de ambiente:
 - `BOLETO_API_KEY_LLM`: Chave API do LLM (padrão: `ollama`)
 - `BOLETO_TESSERACT_LANG`: Idioma do Tesseract OCR (padrão: `por`)
 - `BOLETO_LOG_LEVEL`: Nível de log - DEBUG, INFO, WARNING, ERROR (padrão: `INFO`)
+
+IMPORTANTE: Nunca compartilhe ou versione arquivos contendo valores reais de `BOLETO_API_KEY_LLM`. Use variáveis de ambiente ou arquivos de configuração não versionados.
 
 ### Arquivo CSV de Classificação
 
@@ -119,6 +133,8 @@ python boleto_extract.py --modelo llama3.2
 python boleto_extract.py --base-url-llm https://api.openai.com/v1 --api-key-llm sua_chave_api
 ```
 
+ATENCAO: Ao usar serviços LLM externos (OpenAI, Anthropic, etc.), o conteúdo completo dos comprovantes será enviado para servidores de terceiros. Verifique as políticas de privacidade e retenção de dados do provedor.
+
 ### Ajustando Nível de Log
 
 ```bash
@@ -177,6 +193,8 @@ O script gera dois tipos de log:
 - **Console**: Saída em tempo real
 - **Arquivo**: `boleto_extract.log` no diretório de execução
 
+ATENCAO: Os arquivos de log podem conter trechos do conteúdo extraído dos comprovantes. Proteja adequadamente estes arquivos e não os compartilhe publicamente.
+
 ### Resumo de Erros
 
 Ao final do processamento, exibe um resumo completo de todos os arquivos que falharam, incluindo:
@@ -206,6 +224,11 @@ boleto_extract/
 ├── boleto_extract.log       # Log de execução (gerado)
 └── README.md                # Este arquivo
 ```
+
+RECOMENDACAO: Adicione ao .gitignore:
+- `boleto_extract.log` (pode conter dados sensíveis)
+- Arquivos de comprovantes processados
+- Arquivos de configuração com credenciais
 
 ## Solução de Problemas
 
