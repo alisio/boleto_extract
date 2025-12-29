@@ -1,0 +1,18 @@
+services:
+  boleto_extract:
+    build: .
+    image: boleto_extract:latest
+    environment:
+      BOLETO_MODELO_LLM: ${BOLETO_MODELO_LLM:-gemma3:4b}
+      BOLETO_BASE_URL_LLM: ${BOLETO_BASE_URL_LLM:-http://host.docker.internal:11434/v1}
+      BOLETO_API_KEY_LLM: ${BOLETO_API_KEY_LLM:-ollama}
+      BOLETO_TESSERACT_LANG: ${BOLETO_TESSERACT_LANG:-por}
+      BOLETO_LOG_LEVEL: ${BOLETO_LOG_LEVEL:-INFO}
+    volumes:
+      - ./comprovantes:/data
+      - ./dbcodigocontas.csv:/data/dbcodigocontas.csv:ro
+    command:
+      - --path_arquivos
+      - /data
+      - --path_base_contas
+      - /data/dbcodigocontas.csv

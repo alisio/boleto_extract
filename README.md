@@ -60,6 +60,35 @@ sudo apt-get install tesseract-ocr tesseract-ocr-por
 **Windows:**
 Baixe o instalador em: https://github.com/UB-Mannheim/tesseract/wiki
 
+## Docker (servidor e automação)
+
+Este repositório inclui um `Dockerfile` para execução em servidores/automação.
+
+### Build da imagem
+
+```bash
+docker build -t boleto_extract:latest .
+```
+
+### Execução com volume
+
+Monte um diretório com os comprovantes e o CSV de classificação em `/data`:
+
+```bash
+docker run --rm \
+  -v "$PWD/comprovantes:/data" \
+  -v "$PWD/dbcodigocontas.csv:/data/dbcodigocontas.csv:ro" \
+  -e BOLETO_MODELO_LLM=gemma3:4b \
+  -e BOLETO_BASE_URL_LLM=http://host.docker.internal:11434/v1 \
+  -e BOLETO_API_KEY_LLM=ollama \
+  boleto_extract:latest
+```
+
+Notas:
+- O log `boleto_extract.log` será gerado dentro do volume `/data`.
+- Para Linux, use `--add-host=host.docker.internal:host-gateway` ou aponte `BOLETO_BASE_URL_LLM` para o IP do host.
+- Você pode passar argumentos adicionais no final do comando (ex.: `--dry-run --timeout 120`).
+
 ## Configuração
 
 ### Variáveis de Ambiente
