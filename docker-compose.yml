@@ -10,9 +10,9 @@ services:
       BOLETO_LOG_LEVEL: ${BOLETO_LOG_LEVEL:-INFO}
     volumes:
       - ./comprovantes:/data
-      - ./dbcodigocontas.csv:/data/dbcodigocontas.csv:ro
+      - ./dbcodigocontas.csv:/db/dbcodigocontas.csv:ro
     command:
       - --path_arquivos
       - /data
       - --path_base_contas
-      - /data/dbcodigocontas.csv
+      - /db/dbcodigocontas.csv
