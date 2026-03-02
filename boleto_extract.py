@@ -321,6 +321,20 @@ def extract_text_from_image(image_path):
         raise
 
 
+def converter_imagem_para_pdf(imagem_path, destino_pdf):
+    """Converte uma imagem (PNG/JPG) para PDF."""
+    try:
+        with Image.open(imagem_path) as img:
+            if img.mode == 'RGBA':
+                img = img.convert('RGB')
+            img.save(destino_pdf, 'PDF', resolution=100.0)
+        logger.info(f"Imagem convertida para PDF: {imagem_path} -> {destino_pdf}")
+        return True
+    except Exception as e:
+        logger.error(f"Erro ao converter imagem para PDF: {e}")
+        raise
+
+
 def enviar_para_llm(texto, prompt, modelo=None, timeout=60):
     """Envia texto para um modelo de linguagem e retorna a resposta formatada."""
     if modelo is None:
@@ -610,15 +624,25 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
                 erros += 1
                 continue
             
-            # Criar novo nome
-            extensao = Path(arquivo).suffix[1:]  # Remove o ponto
-            novo_nome = f"{data_pagamento}-R${valor_formatado}-{classificacao}.{extensao}"
+            # Criar novo nome - sempre PDF para imagens
+            extensao_original = Path(arquivo).suffix[1:].lower()
+            extensao_saida = 'pdf' if extensao_original in ['png', 'jpg', 'jpeg'] else extensao_original
+            novo_nome = f"{data_pagamento}-R${valor_formatado}-{classificacao}.{extensao_saida}"
             
             # Renomear arquivo
             origem = Path(path_arquivos) / arquivo
             destino = Path(path_arquivos) / novo_nome
             
-            renomear_arquivo(origem, destino, dry_run=dry_run)
+            # Se entrada é imagem e saída é PDF, converter
+            if extensao_original in ['png', 'jpg', 'jpeg'] and extensao_saida == 'pdf':
+                logger.info(f"Convertendo {extensao_original} para PDF...")
+                converter_imagem_para_pdf(origem, destino)
+                # Renomear original para não ser processado novamente
+                origem_renomeado = Path(path_arquivos) / f"convertido_{arquivo}"
+                origem.rename(origem_renomeado)
+                logger.info(f"Arquivo original renomeado: {arquivo} -> convertido_{arquivo}")
+            else:
+                renomear_arquivo(origem, destino, dry_run=dry_run)
             sucessos += 1
             
             logger.info(f"✓ {arquivo} processado com sucesso -> {novo_nome}")

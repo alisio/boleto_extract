@@ -19,7 +19,7 @@ ATENCAO: Este script processa documentos financeiros que podem conter informaç�
 - Extração de texto de PDFs e imagens usando OCR (Tesseract)
 - Processamento de texto com modelos LLM (Ollama, OpenAI, etc.)
 - Classificação automática de boletos baseada em códigos do CSV
-- Renomeação automática de arquivos no formato: `YYYY-MM-DD-R$VALOR-CLASSIFICACAO.ext`
+- Renomeação automática de arquivos no formato: `YYYY-MM-DD-R$VALOR-CLASSIFICACAO.ext` (imagens são convertidas para PDF)
 - Validação robusta de dados extraídos
 - Sistema de logging completo
 - Modo dry-run para simulação sem modificar arquivos
