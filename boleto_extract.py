@@ -263,7 +263,7 @@ def extract_content(file_path):
 
 
 def extract_text_from_pdf(pdf_path):
-    """Extrai texto de um arquivo PDF."""
+    """Extrai texto de um arquivo PDF (texto embutido ou OCR para PDFs escaneados)."""
     text = ""
     
     # Validação de entrada
@@ -284,6 +284,22 @@ def extract_text_from_pdf(pdf_path):
                 page_text = page.get_text()
                 text += page_text
                 logger.debug(f"Página {page_num + 1}: {len(page_text)} caracteres extraídos")
+            
+            # Se texto extraído for vazio, tentar OCR (PDF escaneado)
+            if not text.strip():
+                logger.info("Texto vazio - tentando OCR para PDF escaneado...")
+                text = ""
+                for page_num, page in enumerate(doc):
+                    # Renderizar página como imagem
+                    pix = page.get_pixmap(matrix=fitz.Matrix(2, 2))
+                    img_data = pix.tobytes("png")
+                    
+                    # OCR na imagem
+                    from io import BytesIO
+                    img = Image.open(BytesIO(img_data))
+                    page_text = pytesseract.image_to_string(img, lang=CONFIG['tesseract_lang'])
+                    text += page_text
+                    logger.debug(f"Página {page_num + 1} OCR: {len(page_text)} caracteres")
         
         logger.info(f"Texto extraído do PDF: {len(text)} caracteres totais.")
         return text
