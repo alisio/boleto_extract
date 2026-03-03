@@ -7,7 +7,7 @@
 set -e
 
 # Configurações
-IMAGE_NAME="boleto-extract"
+IMAGE_NAME="boleto_extract"
 DOCKER_REGISTRY="${DOCKER_REGISTRY:-docker.io}"
 DOCKER_USERNAME="${DOCKER_USERNAME:-}"
 TAG="${TAG:-latest}"
