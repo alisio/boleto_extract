@@ -224,6 +224,22 @@ def carregar_base_contas(path_csv):
     return df
 
 
+# Sufixo usado para marcar imagens processadas
+SUFIXO_PROCESSADO = ".processed"
+
+
+def get_processed_image_path(original_path):
+    """Retorna o caminho da imagem processada com sufixo."""
+    path = Path(original_path)
+    return path.parent / f"{path.stem}{SUFIXO_PROCESSADO}{path.suffix}"
+
+
+def is_image_processed(image_path):
+    """Verifica se a imagem já foi processada (existe versão com sufixo .processed)."""
+    processed_path = get_processed_image_path(image_path)
+    return processed_path.exists()
+
+
 def listar_arquivos(diretorio):
     """Lista arquivos válidos em um diretório, filtrando por data no nome e extensões permitidas."""
     regex_data = re.compile(r'^\d{4}-\d{2}-\d{2}')
@@ -237,6 +253,16 @@ def listar_arquivos(diretorio):
         raise
 
     for arquivo in arquivos_dir:
+        # Ignorar arquivos já processados (com sufixo .processed)
+        if SUFIXO_PROCESSADO in arquivo:
+            logger.debug(f"Arquivo ignorado (já processado): {arquivo}")
+            continue
+        
+        # Ignorar arquivos legados com prefixo convertido_ (de versões anteriores)
+        if arquivo.lower().startswith('convertido_'):
+            logger.debug(f"Arquivo ignorado (legado convertido_): {arquivo}")
+            continue
+
         if arquivo.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')) and not regex_data.match(arquivo) and 'naoidentificado' not in arquivo.lower():
             arquivos_validos.append(arquivo)
 
@@ -651,12 +677,14 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
             
             # Se entrada é imagem e saída é PDF, converter
             if extensao_original in ['png', 'jpg', 'jpeg'] and extensao_saida == 'pdf':
-                logger.info(f"Convertendo {extensao_original} para PDF...")
-                converter_imagem_para_pdf(origem, destino)
-                # Renomear original para não ser processado novamente
-                origem_renomeado = Path(path_arquivos) / f"convertido_{arquivo}"
-                origem.rename(origem_renomeado)
-                logger.info(f"Arquivo original renomeado: {arquivo} -> convertido_{arquivo}")
+                if dry_run:
+                    logger.info(f"[DRY-RUN] Converteria {extensao_original} para PDF: {origem} -> {destino}")
+                else:
+                    logger.info(f"Convertendo {extensao_original} para PDF...")
+                    converter_imagem_para_pdf(origem, destino)
+                    # Deletar original após conversão bem-sucedida
+                    origem.unlink()
+                    logger.info(f"Arquivo original removido após conversão: {arquivo}")
             else:
                 renomear_arquivo(origem, destino, dry_run=dry_run)
             sucessos += 1
