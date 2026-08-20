@@ -38,6 +38,7 @@ import json
 import ast
 import argparse
 import logging
+import logging.handlers
 from datetime import datetime
 import fitz   # PyMuPDF
 import pytesseract
@@ -52,12 +53,24 @@ import shutil
 
 
 # Configuração de logging
+BOLETO_LOG_FILE = os.getenv('BOLETO_LOG_FILE', 'boleto_extract.log')
+BOLETO_LOG_MAX_MB = int(os.getenv('BOLETO_LOG_MAX_MB', '50'))
+BOLETO_LOG_BACKUPS = int(os.getenv('BOLETO_LOG_BACKUPS', '3'))
+
+_log_dir = os.path.dirname(BOLETO_LOG_FILE)
+if _log_dir:
+    os.makedirs(_log_dir, exist_ok=True)
+
 logging.basicConfig(
     level=logging.INFO,
     format='%(asctime)s - %(levelname)s - %(message)s',
     handlers=[
         logging.StreamHandler(),
-        logging.FileHandler('boleto_extract.log')
+        logging.handlers.RotatingFileHandler(
+            BOLETO_LOG_FILE,
+            maxBytes=BOLETO_LOG_MAX_MB * 1024 * 1024,
+            backupCount=BOLETO_LOG_BACKUPS
+        )
     ]
 )
 logger = logging.getLogger(__name__)
@@ -719,6 +732,9 @@ Variáveis de ambiente suportadas:
   BOLETO_API_KEY_LLM      Chave API do LLM (padrão: ollama)
   BOLETO_TESSERACT_LANG   Idioma do Tesseract OCR (padrão: por)
   BOLETO_LOG_LEVEL        Nível de log: DEBUG, INFO, WARNING, ERROR (padrão: INFO)
+  BOLETO_LOG_FILE        Caminho do arquivo de log (padrão: boleto_extract.log no diretório de trabalho)
+  BOLETO_LOG_MAX_MB      Tamanho máximo do log em MB antes de rotacionar (padrão: 50)
+  BOLETO_LOG_BACKUPS     Número de arquivos de log rotacionados a manter (padrão: 3)
 
 Exemplos:
   python boleto_extract.py --path_arquivos /caminho/dos/pdfs --path_base_contas contas.csv
