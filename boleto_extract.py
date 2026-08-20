@@ -34,6 +34,7 @@ Pre requisitos:
 
 import os
 import re
+import hashlib
 import json
 import ast
 import argparse
@@ -241,19 +242,7 @@ def carregar_base_contas(path_csv):
 SUFIXO_PROCESSADO = ".processed"
 
 
-def get_processed_image_path(original_path):
-    """Retorna o caminho da imagem processada com sufixo."""
-    path = Path(original_path)
-    return path.parent / f"{path.stem}{SUFIXO_PROCESSADO}{path.suffix}"
-
-
-def is_image_processed(image_path):
-    """Verifica se a imagem já foi processada (existe versão com sufixo .processed)."""
-    processed_path = get_processed_image_path(image_path)
-    return processed_path.exists()
-
-
-def listar_arquivos(diretorio):
+def listar_arquivos(diretorio, reclassificar=False):
     """Lista arquivos válidos em um diretório, filtrando por data no nome e extensões permitidas."""
     regex_data = re.compile(r'^\d{4}-\d{2}-\d{2}')
     arquivos_validos = []
@@ -276,10 +265,14 @@ def listar_arquivos(diretorio):
             logger.debug(f"Arquivo ignorado (legado convertido_): {arquivo}")
             continue
 
-        if arquivo.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')) and not regex_data.match(arquivo) and 'naoidentificado' not in arquivo.lower() and 'erro_criptografado' not in arquivo.lower():
+        if arquivo.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')) and 'erro_criptografado' not in arquivo.lower():
+            ja_datado = bool(regex_data.match(arquivo))
+            eh_naoidentificado = 'naoidentificado' in arquivo.lower()
+            if ja_datado and not (reclassificar and eh_naoidentificado):
+                continue
             arquivos_validos.append(arquivo)
 
-    logger.info(f"Encontrados {len(arquivos_validos)} arquivos válidos para processamento")
+    logger.info(f"Encontrados {len(arquivos_validos)} arquivos válidos para processamento (reclassificar: {reclassificar})")
     return arquivos_validos
 
 
@@ -547,7 +540,7 @@ def renomear_arquivo(origem, destino, dry_run=False):
         raise
 
 
-def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, timeout=60):
+def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, timeout=60, reclassificar=False):
     """Função principal para processar e renomear arquivos de comprovantes de pagamento."""
     
     # Validação de entrada
@@ -581,7 +574,7 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
         raise
 
     # Listar arquivos para processar
-    arquivos = listar_arquivos(path_arquivos)
+    arquivos = listar_arquivos(path_arquivos, reclassificar=reclassificar)
     if not arquivos:
         logger.warning("Nenhum arquivo válido encontrado para processamento")
         return
@@ -599,6 +592,7 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
     sucessos = 0
     erros = 0
     arquivos_com_erro = []
+    arquivos_nao_classificados = []
 
     for arquivo in arquivos:
         logger.info(f"Processando arquivo: {arquivo}")
@@ -689,11 +683,20 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
             # Criar novo nome - sempre PDF para imagens
             extensao_original = Path(arquivo).suffix[1:].lower()
             extensao_saida = 'pdf' if extensao_original in ['png', 'jpg', 'jpeg'] else extensao_original
-            novo_nome = f"{data_pagamento}-R${valor_formatado}-{classificacao}.{extensao_saida}"
+            if classificacao == 'naoidentificado':
+                sufixo_hash = hashlib.sha256(conteudo.encode('utf-8')).hexdigest()[:8]
+                novo_nome = f"{data_pagamento}-R${valor_formatado}-naoidentificado-{sufixo_hash}.{extensao_saida}"
+            else:
+                novo_nome = f"{data_pagamento}-R${valor_formatado}-{classificacao}.{extensao_saida}"
             
             # Renomear arquivo
             origem = Path(path_arquivos) / arquivo
             destino = Path(path_arquivos) / novo_nome
+
+            # Evitar ping-pong no --reclassificar: nome já é o final, não renomear/convertar/recontar
+            if origem.name == novo_nome:
+                logger.info(f"{arquivo} já está no formato final")
+                continue
             
             # Se entrada é imagem e saída é PDF, converter
             if extensao_original in ['png', 'jpg', 'jpeg'] and extensao_saida == 'pdf':
@@ -707,6 +710,10 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
                     logger.info(f"Arquivo original removido após conversão: {arquivo}")
             else:
                 renomear_arquivo(origem, destino, dry_run=dry_run)
+
+            # Auditoria: registrar apenas quando efetivamente renomeado/convertido com sucesso
+            if classificacao == 'naoidentificado':
+                arquivos_nao_classificados.append({'original': arquivo, 'novo': novo_nome})
             sucessos += 1
             
             logger.info(f"✓ {arquivo} processado com sucesso -> {novo_nome}")
@@ -735,6 +742,14 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
         for item in arquivos_com_erro:
             logger.error(f"  - {item['arquivo']}: {item['erro']}")
         logger.error("=" * 60)
+
+    if arquivos_nao_classificados:
+        logger.warning("=" * 60)
+        logger.warning(f"NÃO CLASSIFICADOS ({len(arquivos_nao_classificados)}):")
+        for item in arquivos_nao_classificados:
+            logger.warning(f"  - {item['original']} -> {item['novo']}")
+        logger.warning("Dica: atualize dbcodigocontas.csv e rode com --reclassificar")
+        logger.warning("=" * 60)
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -808,6 +823,12 @@ Exemplos:
         help='Executa sem renomear arquivos (apenas simula)'
     )
 
+    parser.add_argument(
+        '--reclassificar',
+        action='store_true',
+        help='Reprocessa arquivos não classificados já renomeados (YYYY-MM-DD-...-naoidentificado.*) após atualização do CSV'
+    )
+
     args = parser.parse_args()
 
     try:
@@ -837,7 +858,7 @@ Exemplos:
                 logger.info(f"{key}: {value}")
         logger.info("==================")
 
-        main(args.path_arquivos, args.path_base_contas, args.modelo, dry_run=args.dry_run, timeout=args.timeout)
+        main(args.path_arquivos, args.path_base_contas, args.modelo, dry_run=args.dry_run, timeout=args.timeout, reclassificar=args.reclassificar)
         
     except KeyboardInterrupt:
         logger.info("Processamento interrompido pelo usuário")

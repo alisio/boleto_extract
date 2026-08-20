@@ -195,6 +195,7 @@ python boleto_extract.py \
 | `--timeout` | int | `60` | Timeout em segundos para chamadas ao LLM |
 | `--log-level` | choice | `INFO` | Nível de log (DEBUG/INFO/WARNING/ERROR) |
 | `--dry-run` | flag | `false` | Executa sem renomear arquivos |
+| `--reclassificar` | flag | `false` | Reprocessa arquivos não classificados já renomeados após atualização do CSV |
 
 ## Formato de Saída
 
@@ -207,14 +208,24 @@ YYYY-MM-DD-R$VALOR-CLASSIFICACAO.extensao
 Exemplos:
 - `2023-02-17-R$10799.10-energia.pdf`
 - `2020-08-20-R$41.00-agua.jpg`
-- `2024-10-15-R$150.50-naoidentificado.png`
+- `2024-10-15-R$150.50-naoidentificado-a1b2c3d4.pdf`
 
 ## Arquivos Processados
 
 O script processa apenas arquivos que:
 - Tenham extensão `.pdf`, `.jpg`, `.jpeg` ou `.png`
-- NÃO comecem com data no formato `YYYY-MM-DD` (evita reprocessamento)
-- NÃO contenham "naoidentificado" no nome
+- NÃO contenham "erro_criptografado" no nome
+- NÃO tenham prefixo de data no formato `YYYY-MM-DD` (evita reprocessamento)
+
+Exceção: arquivos já renomeados como não classificados (`YYYY-MM-DD-...-naoidentificado...`) são ignorados em execuções normais (possuem prefixo de data), mas podem ser reprocessados seletivamente com:
+
+```bash
+python boleto_extract.py --reclassificar
+```
+
+Com `--reclassificar`, QUALQUER arquivo datado contendo "naoidentificado" no nome volta a ser processado — tanto o formato atual com hash discriminador (`2024-10-15-R$150.50-naoidentificado-a1b2c3d4.pdf`) quanto legados renomeados antes desta feature, sem hash (ex.: `2024-10-15-R$150.50-naoidentificado.png`).
+
+Isso permite reprocessá-los após atualizar o `dbcodigocontas.csv` com novas classificações. Se o conteúdo continuar sem classificação, o arquivo é mantido no mesmo nome (sem renomear).
 
 ## Logging
 
