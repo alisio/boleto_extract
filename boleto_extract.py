@@ -276,7 +276,7 @@ def listar_arquivos(diretorio):
             logger.debug(f"Arquivo ignorado (legado convertido_): {arquivo}")
             continue
 
-        if arquivo.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')) and not regex_data.match(arquivo) and 'naoidentificado' not in arquivo.lower():
+        if arquivo.lower().endswith(('.pdf', '.jpeg', '.jpg', '.png')) and not regex_data.match(arquivo) and 'naoidentificado' not in arquivo.lower() and 'erro_criptografado' not in arquivo.lower():
             arquivos_validos.append(arquivo)
 
     logger.info(f"Encontrados {len(arquivos_validos)} arquivos válidos para processamento")
@@ -315,6 +315,13 @@ def extract_text_from_pdf(pdf_path):
     try:
         with fitz.open(pdf_path) as doc:
             logger.debug(f"PDF aberto com {len(doc)} páginas")
+            
+            if doc.needs_pass or doc.is_encrypted:
+                logger.debug(f"PDF criptografado detectado, tentando autenticar: {pdf_path}")
+                if doc.authenticate(""):
+                    logger.debug("PDF autenticado com senha vazia")
+                else:
+                    raise ValueError(f"PDF criptografado (senha necessária): {pdf_path}")
             
             if len(doc) == 0:
                 raise ValueError(f"PDF vazio (0 páginas): {pdf_path}")
@@ -709,6 +716,14 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
             logger.error(f"✗ {erro_msg} ao processar {arquivo}", exc_info=True)
             arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro_msg})
             erros += 1
+            if 'criptografado' in str(e).lower():
+                caminho_origem = Path(path_arquivos) / arquivo
+                marcado = renomear_arquivo(
+                    caminho_origem,
+                    caminho_origem.with_name(f"{caminho_origem.stem}-erro_criptografado{caminho_origem.suffix}"),
+                    dry_run=dry_run,
+                )
+                logger.info(f"Arquivo criptografado marcado para inspeção manual: {marcado}")
 
     logger.info(f"Processamento concluído: {sucessos} sucessos, {erros} erros")
     
