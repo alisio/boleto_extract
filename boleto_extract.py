@@ -34,6 +34,8 @@ Pre requisitos:
 
 import os
 import re
+import sys
+import time
 import hashlib
 import json
 import ast
@@ -51,6 +53,7 @@ import csv
 import tempfile
 import atexit
 import shutil
+from filelock import FileLock, Timeout as FileLockTimeout
 
 
 # Configuração de logging
@@ -131,7 +134,10 @@ def obter_configuracao():
         'base_url_llm': os.getenv('BOLETO_BASE_URL_LLM', 'http://localhost:11434/v1'),
         'api_key_llm': os.getenv('BOLETO_API_KEY_LLM', 'ollama'),
         'tesseract_lang': os.getenv('BOLETO_TESSERACT_LANG', 'por'),
-        'log_level': os.getenv('BOLETO_LOG_LEVEL', 'INFO')
+        'log_level': os.getenv('BOLETO_LOG_LEVEL', 'INFO'),
+        'lock_file': os.getenv('BOLETO_LOCK_FILE', '/tmp/boleto_extract.lock'),
+        'stable_timeout': int(os.getenv('BOLETO_STABLE_TIMEOUT', '15')),
+        'stable_interval': float(os.getenv('BOLETO_STABLE_INTERVAL', '0.5')),
     }
     
     # Ajustar nível de log
@@ -503,6 +509,92 @@ def validar_diretorio(diretorio):
     logger.info(f"Diretório validado: {diretorio}")
 
 
+def validar_arquivo(caminho):
+    """Valida se o caminho é um arquivo existente com extensão suportada."""
+    path = Path(caminho)
+    if not path.exists():
+        logger.error(f"Arquivo não encontrado: {caminho}")
+        raise FileNotFoundError(f"Arquivo não encontrado: {caminho}")
+    if not path.is_file():
+        logger.error(f"O caminho não é um arquivo: {caminho}")
+        raise ValueError(f"O caminho fornecido não é um arquivo: {caminho}")
+    ext = path.suffix.lower()
+    if ext not in ('.pdf', '.jpeg', '.jpg', '.png'):
+        raise ValueError(f"Formato de arquivo não suportado: {ext}. Use PDF, JPG, JPEG ou PNG.")
+    if 'erro_criptografado' in path.name.lower():
+        raise ValueError(f"Arquivo marcado como erro criptografado, ignorado: {caminho}")
+    if SUFIXO_PROCESSADO in path.name:
+        raise ValueError(f"Arquivo já processado (sufixo {SUFIXO_PROCESSADO}): {caminho}")
+    if path.name.lower().startswith('convertido_'):
+        raise ValueError(f"Arquivo legado ignorado (convertido_): {caminho}")
+    logger.info(f"Arquivo validado: {caminho}")
+    return path
+
+
+def esperar_arquivo_estavel(caminho, timeout=None, intervalo=None):
+    """Aguarda arquivo ficar com tamanho/mtime estáveis (evita leitura truncada via incrond).
+
+    Retorna True se estável, False se timeout. timeout=0 desativa espera.
+    """
+    if timeout is None:
+        timeout = CONFIG.get('stable_timeout', 15)
+    if intervalo is None:
+        intervalo = CONFIG.get('stable_interval', 0.5)
+    if timeout is not None and timeout <= 0:
+        logger.debug(f"Espera estável desativada (timeout={timeout}) para {caminho}")
+        return True
+    path = Path(caminho)
+    if not path.exists():
+        return False
+    start = time.monotonic()
+    estabilizacoes = 0
+    ultimo_tamanho = -1
+    ultimo_mtime = -1
+    # Precisa de 2 leituras consecutivas iguais
+    while True:
+        try:
+            stat = path.stat()
+            tamanho = stat.st_size
+            mtime = stat.st_mtime
+        except OSError as e:
+            logger.warning(f"Não foi possível stat {caminho}: {e}")
+            tamanho, mtime = -1, -1
+        if tamanho == ultimo_tamanho and mtime == ultimo_mtime and tamanho >= 0:
+            estabilizacoes += 1
+            if estabilizacoes >= 2:
+                logger.info(f"Arquivo estável após {time.monotonic()-start:.1f}s: {caminho} ({tamanho} bytes)")
+                return True
+        else:
+            estabilizacoes = 0
+            ultimo_tamanho, ultimo_mtime = tamanho, mtime
+        if time.monotonic() - start >= timeout:
+            logger.warning(f"Timeout ({timeout}s) aguardando estabilidade de {caminho} (último tamanho={tamanho})")
+            return False
+        time.sleep(intervalo)
+
+
+def extrair_json_llm(resposta):
+    """Limpa resposta do LLM e extrai dict JSON (reuso entre batch e single-file)."""
+    # Remover blocos <think>...</think>
+    resposta = re.sub(r'<think>[\s\S]*?</think>', '', resposta, flags=re.IGNORECASE).strip()
+    resposta_limpa = resposta.replace('{{', '{').replace('}}', '}')
+    resposta_limpa = resposta_limpa.replace('\\"', '"')
+    resposta_limpa = re.sub(r'\\_', '_', resposta_limpa)
+    match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", resposta_limpa)
+    if match:
+        resposta_limpa = match.group(1)
+        logger.debug(f"Bloco JSON extraído: {resposta_limpa}")
+    else:
+        resposta_limpa = resposta_limpa.strip()
+        logger.debug("Nenhum bloco JSON encontrado, usando resposta completa")
+    if resposta_limpa.strip().lower() == 'erro':
+        return None, 'erro'
+    try:
+        return json.loads(resposta_limpa), None
+    except json.JSONDecodeError as e:
+        return None, f"Erro ao decodificar JSON: {str(e)} | Resposta: {resposta_limpa[:200]}"
+
+
 def renomear_arquivo(origem, destino, dry_run=False):
     """Renomeia um arquivo com tratamento de erros."""
     try:
@@ -540,31 +632,85 @@ def renomear_arquivo(origem, destino, dry_run=False):
         raise
 
 
+def _processar_um_arquivo(arquivo_path, df, modelo_atual, timeout, dry_run, reclassificar=False):
+    """Processa um único arquivo (extrai, classifica, LLM, renomeia). Retorna (novo_nome ou None, erro ou None)."""
+    arquivo = Path(arquivo_path).name
+    # Extrair conteúdo
+    conteudo = extract_content(arquivo_path)
+    if not conteudo.strip():
+        return None, f"Nenhum conteúdo extraído de {arquivo}"
+    # Classificar
+    classificacao = classifica_boleto(conteudo, df)
+    # Enviar para LLM
+    resposta = enviar_para_llm(conteudo, PROMPT, modelo_atual, timeout=timeout)
+    resposta_dict, erro = extrair_json_llm(resposta)
+    if erro == 'erro':
+        return None, "LLM não conseguiu extrair informações"
+    if erro:
+        return None, erro
+    if resposta_dict is None:
+        return None, erro or "Resposta inválida do LLM"
+    data_pagamento = str(resposta_dict.get('data_pagamento', '')).strip()
+    valor_pagamento = resposta_dict.get('valor_pagamento')
+    if not data_pagamento or valor_pagamento is None:
+        return None, f"Informações incompletas: data={data_pagamento}, valor={valor_pagamento}"
+    if not validar_data(data_pagamento):
+        return None, f"Data inválida: {data_pagamento}"
+    try:
+        valor_float = float(valor_pagamento)
+        valor_formatado = f"{valor_float:.2f}"
+    except (ValueError, TypeError) as e:
+        return None, f"Valor inválido: {valor_pagamento} - {str(e)}"
+    extensao_original = Path(arquivo).suffix[1:].lower()
+    extensao_saida = 'pdf' if extensao_original in ['png', 'jpg', 'jpeg'] else extensao_original
+    if classificacao == 'naoidentificado':
+        sufixo_hash = hashlib.sha256(conteudo.encode('utf-8')).hexdigest()[:8]
+        novo_nome = f"{data_pagamento}-R${valor_formatado}-naoidentificado-{sufixo_hash}.{extensao_saida}"
+    else:
+        novo_nome = f"{data_pagamento}-R${valor_formatado}-{classificacao}.{extensao_saida}"
+    origem = Path(arquivo_path)
+    destino = origem.parent / novo_nome
+    if origem.name == novo_nome:
+        logger.info(f"{arquivo} já está no formato final")
+        return None, None  # sem erro, mas sem renomeio
+    if extensao_original in ['png', 'jpg', 'jpeg'] and extensao_saida == 'pdf':
+        if dry_run:
+            logger.info(f"[DRY-RUN] Converteria {extensao_original} para PDF: {origem} -> {destino}")
+        else:
+            logger.info(f"Convertendo {extensao_original} para PDF...")
+            converter_imagem_para_pdf(origem, destino)
+            origem.unlink()
+            logger.info(f"Arquivo original removido após conversão: {arquivo}")
+    else:
+        renomear_arquivo(origem, destino, dry_run=dry_run)
+    return novo_nome, None
+
+
 def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, timeout=60, reclassificar=False):
-    """Função principal para processar e renomear arquivos de comprovantes de pagamento."""
-    
-    # Validação de entrada
+    """Função principal para processar e renomear arquivos de comprovantes de pagamento (batch)."""
     if not path_arquivos:
         raise ValueError("path_arquivos não pode ser vazio")
-    
     if not path_base_contas:
         raise ValueError("path_base_contas não pode ser vazio")
-    
     if timeout <= 0:
         raise ValueError("timeout deve ser maior que zero")
-    
-    # Verificar dependências
+    lock_path = CONFIG.get('lock_file', '/tmp/boleto_extract.lock')
+    try:
+        with FileLock(lock_path, timeout=0):
+            return _main_batch(path_arquivos, path_base_contas, modelo_override, dry_run, timeout, reclassificar)
+    except FileLockTimeout:
+        logger.warning(f"Outra instância em execução (lock {lock_path}), abortando.")
+        sys.exit(0)
+
+
+def _main_batch(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, timeout=60, reclassificar=False):
+    """Implementação interna do batch (já com lock adquirido)."""
     verificar_dependencias()
-    
-    # Validar diretórios
     validar_diretorio(path_arquivos)
-    
-    # Validar e carregar CSV
     csv_path = Path(path_base_contas)
     if not csv_path.exists():
         logger.error(f"Arquivo CSV não encontrado: {path_base_contas}")
         raise FileNotFoundError(f"Arquivo CSV não encontrado: {path_base_contas}")
-    
     try:
         df = carregar_base_contas(path_base_contas)
         validar_dataframe(df)
@@ -572,152 +718,38 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
     except Exception as e:
         logger.error(f"Erro ao carregar CSV {path_base_contas}: {e}")
         raise
-
-    # Listar arquivos para processar
     arquivos = listar_arquivos(path_arquivos, reclassificar=reclassificar)
     if not arquivos:
         logger.warning("Nenhum arquivo válido encontrado para processamento")
         return
-
-    # Usar modelo override se fornecido
     modelo_atual = modelo_override or CONFIG['modelo_llm']
-    
     if dry_run:
         logger.info(f"=== MODO DRY-RUN ATIVADO ===")
         logger.info(f"Nenhum arquivo será realmente renomeado")
         logger.info(f"===========================")
-    
     logger.info(f"Iniciando processamento de {len(arquivos)} arquivos com modelo {modelo_atual}")
-
     sucessos = 0
     erros = 0
     arquivos_com_erro = []
     arquivos_nao_classificados = []
-
     for arquivo in arquivos:
         logger.info(f"Processando arquivo: {arquivo}")
-        
         try:
-            # Extrair conteúdo
             arquivo_path = Path(path_arquivos) / arquivo
-            conteudo = extract_content(arquivo_path)
-            
-            if not conteudo.strip():
-                erro_msg = f"Nenhum conteúdo extraído de {arquivo}"
-                logger.error(erro_msg)
-                arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro_msg})
+            novo_nome, erro = _processar_um_arquivo(arquivo_path, df, modelo_atual, timeout, dry_run, reclassificar=reclassificar)
+            if erro:
+                logger.error(f"{erro} de {arquivo}")
+                arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro})
                 erros += 1
                 continue
-            
-            # Classificar boleto
-            classificacao = classifica_boleto(conteudo, df)
-            
-            # Enviar para LLM
-            resposta = enviar_para_llm(conteudo, PROMPT, modelo_atual, timeout=timeout)
-
-            # Remover blocos de raciocínio entre tags <think>...</think>
-            resposta = re.sub(r'<think>[\s\S]*?</think>', '', resposta, flags=re.IGNORECASE).strip()
-            
-            # Limpar resposta (remover chaves duplas se existirem)
-            resposta_limpa = resposta.replace('{{', '{').replace('}}', '}')
-            resposta_limpa = resposta_limpa.replace('\\"', '"')
-            resposta_limpa = re.sub(r'\\_', '_', resposta_limpa)
-            # print("resposta_limpa",resposta_limpa)
-
-            # Extrair JSON dentro de bloco de código markdown
-            match = re.search(r"```json\s*(\{[\s\S]*?\})\s*```", resposta_limpa)
-            if match:
-                resposta_limpa = match.group(1)
-                logger.debug(f"Bloco JSON extraído: {resposta_limpa}")
-            else:
-                resposta_limpa = resposta_limpa.strip()
-                logger.debug("Nenhum bloco JSON encontrado, usando resposta completa")
-
-            if resposta_limpa.strip().lower() == 'erro':
-                erro_msg = f"LLM não conseguiu extrair informações"
-                logger.error(f"{erro_msg} de {arquivo}")
-                arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro_msg})
-                erros += 1
+            if novo_nome is None:
+                # já no formato final
                 continue
-
-            try:
-                resposta_dict = json.loads(resposta_limpa)
-            except json.JSONDecodeError as e:
-                erro_msg = f"Erro ao decodificar JSON: {str(e)}"
-                logger.error(f"{erro_msg} para {arquivo}. Resposta: {resposta_limpa[:200]}...")
-                arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro_msg})
-                erros += 1
-                continue
-            
-            # Extrair e validar dados
-            data_pagamento = resposta_dict.get('data_pagamento', '').strip()
-            valor_pagamento = resposta_dict.get('valor_pagamento')
-            
-            if not data_pagamento or valor_pagamento is None:
-                erro_msg = f"Informações incompletas: data={data_pagamento}, valor={valor_pagamento}"
-                logger.error(f"{erro_msg} extraídas de {arquivo}")
-                arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro_msg})
-                erros += 1
-                continue
-            
-            # Validar data
-            if not validar_data(data_pagamento):
-                erro_msg = f"Data inválida: {data_pagamento}"
-                logger.error(f"{erro_msg} extraída de {arquivo}")
-                arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro_msg})
-                erros += 1
-                continue
-            
-            # Formatar valor
-            try:
-                valor_float = float(valor_pagamento)
-                # valor_formatado = f"{valor_float:.2f}".replace('.', ',')
-                valor_formatado = f"{valor_float:.2f}"
-            except (ValueError, TypeError) as e:
-                erro_msg = f"Valor inválido: {valor_pagamento} - {str(e)}"
-                logger.error(f"{erro_msg} extraído de {arquivo}")
-                arquivos_com_erro.append({'arquivo': arquivo, 'erro': erro_msg})
-                erros += 1
-                continue
-            
-            # Criar novo nome - sempre PDF para imagens
-            extensao_original = Path(arquivo).suffix[1:].lower()
-            extensao_saida = 'pdf' if extensao_original in ['png', 'jpg', 'jpeg'] else extensao_original
-            if classificacao == 'naoidentificado':
-                sufixo_hash = hashlib.sha256(conteudo.encode('utf-8')).hexdigest()[:8]
-                novo_nome = f"{data_pagamento}-R${valor_formatado}-naoidentificado-{sufixo_hash}.{extensao_saida}"
-            else:
-                novo_nome = f"{data_pagamento}-R${valor_formatado}-{classificacao}.{extensao_saida}"
-            
-            # Renomear arquivo
-            origem = Path(path_arquivos) / arquivo
-            destino = Path(path_arquivos) / novo_nome
-
-            # Evitar ping-pong no --reclassificar: nome já é o final, não renomear/convertar/recontar
-            if origem.name == novo_nome:
-                logger.info(f"{arquivo} já está no formato final")
-                continue
-            
-            # Se entrada é imagem e saída é PDF, converter
-            if extensao_original in ['png', 'jpg', 'jpeg'] and extensao_saida == 'pdf':
-                if dry_run:
-                    logger.info(f"[DRY-RUN] Converteria {extensao_original} para PDF: {origem} -> {destino}")
-                else:
-                    logger.info(f"Convertendo {extensao_original} para PDF...")
-                    converter_imagem_para_pdf(origem, destino)
-                    # Deletar original após conversão bem-sucedida
-                    origem.unlink()
-                    logger.info(f"Arquivo original removido após conversão: {arquivo}")
-            else:
-                renomear_arquivo(origem, destino, dry_run=dry_run)
-
-            # Auditoria: registrar apenas quando efetivamente renomeado/convertido com sucesso
-            if classificacao == 'naoidentificado':
+            # need conteudo for hash classification check -> re-classify already done; check naoidentificado
+            if 'naoidentificado' in novo_nome:
                 arquivos_nao_classificados.append({'original': arquivo, 'novo': novo_nome})
             sucessos += 1
-            
             logger.info(f"✓ {arquivo} processado com sucesso -> {novo_nome}")
-            
         except Exception as e:
             erro_msg = f"Erro inesperado: {str(e)}"
             logger.error(f"✗ {erro_msg} ao processar {arquivo}", exc_info=True)
@@ -731,10 +763,7 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
                     dry_run=dry_run,
                 )
                 logger.info(f"Arquivo criptografado marcado para inspeção manual: {marcado}")
-
     logger.info(f"Processamento concluído: {sucessos} sucessos, {erros} erros")
-    
-    # Exibir resumo de erros
     if arquivos_com_erro:
         logger.error("=" * 60)
         logger.error("RESUMO DE ARQUIVOS COM ERRO:")
@@ -742,7 +771,6 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
         for item in arquivos_com_erro:
             logger.error(f"  - {item['arquivo']}: {item['erro']}")
         logger.error("=" * 60)
-
     if arquivos_nao_classificados:
         logger.warning("=" * 60)
         logger.warning(f"NÃO CLASSIFICADOS ({len(arquivos_nao_classificados)}):")
@@ -750,6 +778,64 @@ def main(path_arquivos, path_base_contas, modelo_override=None, dry_run=False, t
             logger.warning(f"  - {item['original']} -> {item['novo']}")
         logger.warning("Dica: atualize dbcodigocontas.csv e rode com --reclassificar")
         logger.warning("=" * 60)
+
+
+def main_single_file(path_arquivo, path_base_contas, modelo_override=None, dry_run=False, timeout=60, stable_timeout=None):
+    """Processa um único arquivo (incrond). Espera estabilidade e usa lock sempre ativo."""
+    if not path_arquivo:
+        raise ValueError("path_arquivo não pode ser vazio")
+    if not path_base_contas:
+        raise ValueError("path_base_contas não pode ser vazio")
+    if timeout <= 0:
+        raise ValueError("timeout deve ser maior que zero")
+    if stable_timeout is None:
+        stable_timeout = CONFIG.get('stable_timeout', 15)
+    lock_path = CONFIG.get('lock_file', '/tmp/boleto_extract.lock')
+    try:
+        with FileLock(lock_path, timeout=0):
+            return _main_single_file(path_arquivo, path_base_contas, modelo_override, dry_run, timeout, stable_timeout)
+    except FileLockTimeout:
+        logger.warning(f"Outra instância em execução (lock {lock_path}), abortando.")
+        sys.exit(0)
+
+
+def _main_single_file(path_arquivo, path_base_contas, modelo_override=None, dry_run=False, timeout=60, stable_timeout=15):
+    verificar_dependencias()
+    arquivo_path = validar_arquivo(path_arquivo)
+    # Espera arquivo ficar estável (evita PDF truncado)
+    esperar_arquivo_estavel(arquivo_path, timeout=stable_timeout)
+    csv_path = Path(path_base_contas)
+    if not csv_path.exists():
+        logger.error(f"Arquivo CSV não encontrado: {path_base_contas}")
+        raise FileNotFoundError(f"Arquivo CSV não encontrado: {path_base_contas}")
+    df = carregar_base_contas(path_base_contas)
+    validar_dataframe(df)
+    df['codigos'] = df['codigos'].apply(normalizar_codigos)
+    modelo_atual = modelo_override or CONFIG['modelo_llm']
+    if dry_run:
+        logger.info(f"=== MODO DRY-RUN ATIVADO ===")
+    logger.info(f"Processando arquivo único: {arquivo_path} com modelo {modelo_atual}")
+    try:
+        novo_nome, erro = _processar_um_arquivo(arquivo_path, df, modelo_atual, timeout, dry_run)
+        if erro:
+            logger.error(f"Falha ao processar {arquivo_path.name}: {erro}")
+            raise RuntimeError(erro)
+        if novo_nome is None:
+            logger.info(f"{arquivo_path.name} já está no formato final, nada a fazer")
+            return
+        logger.info(f"✓ {arquivo_path.name} -> {novo_nome}")
+        if 'naoidentificado' in novo_nome:
+            logger.warning(f"Não classificado: {arquivo_path.name} -> {novo_nome} (atualize CSV e use --reclassificar)")
+    except Exception as e:
+        # Marcar criptografado se for o caso
+        if 'criptografado' in str(e).lower():
+            marcado = renomear_arquivo(
+                arquivo_path,
+                arquivo_path.with_name(f"{arquivo_path.stem}-erro_criptografado{arquivo_path.suffix}"),
+                dry_run=dry_run,
+            )
+            logger.info(f"Arquivo criptografado marcado para inspeção manual: {marcado}")
+        raise
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(
@@ -765,9 +851,13 @@ Variáveis de ambiente suportadas:
   BOLETO_LOG_FILE        Caminho do arquivo de log (padrão: boleto_extract.log no diretório de trabalho)
   BOLETO_LOG_MAX_MB      Tamanho máximo do log em MB antes de rotacionar (padrão: 50)
   BOLETO_LOG_BACKUPS     Número de arquivos de log rotacionados a manter (padrão: 3)
+  BOLETO_LOCK_FILE       Caminho do lock file (padrão: /tmp/boleto_extract.lock)
+  BOLETO_STABLE_TIMEOUT  Timeout de estabilidade para --arquivo em segundos (padrão: 15, 0 desativa)
+  BOLETO_STABLE_INTERVAL Intervalo de polling para estabilidade em segundos (padrão: 0.5)
 
 Exemplos:
   python boleto_extract.py --path_arquivos /caminho/dos/pdfs --path_base_contas contas.csv
+  python boleto_extract.py --arquivo /caminho/boleto.pdf --path_base_contas contas.csv  # incrond: $@/$#
   python boleto_extract.py --modelo llama3.2 --log-level DEBUG
         """
     )
@@ -776,6 +866,12 @@ Exemplos:
         '--path_arquivos', 
         default='./', 
         help='Diretório contendo os arquivos a serem processados (padrão: diretório atual)'
+    )
+
+    parser.add_argument(
+        '--arquivo',
+        default=None,
+        help='Arquivo único para processamento event-driven (incrond $@/$#). Mutuamente exclusivo com --path_arquivos'
     )
     
     parser.add_argument(
@@ -816,6 +912,13 @@ Exemplos:
         default=60,
         help='Timeout em segundos para chamadas ao LLM (padrão: 60)'
     )
+
+    parser.add_argument(
+        '--stable-timeout',
+        type=int,
+        default=None,
+        help='Timeout em segundos aguardando arquivo ficar estável para --arquivo (padrão: 15, 0 desativa; sobrescreve BOLETO_STABLE_TIMEOUT)'
+    )
     
     parser.add_argument(
         '--dry-run', 
@@ -830,6 +933,10 @@ Exemplos:
     )
 
     args = parser.parse_args()
+
+    # Validação mutuamente exclusiva --arquivo vs --path_arquivos não-default
+    if args.arquivo is not None and args.path_arquivos != './':
+        parser.error("--arquivo e --path_arquivos são mutuamente exclusivos (use apenas um)")
 
     try:
         # Atualizar configuração com argumentos CLI (prioridade sobre env vars)
@@ -848,6 +955,8 @@ Exemplos:
             logger.setLevel(log_level)
             for handler in logger.handlers:
                 handler.setLevel(log_level)
+        if args.stable_timeout is not None:
+            CONFIG['stable_timeout'] = args.stable_timeout
 
         # Log da configuração final
         logger.info("=== Configuração ===")
@@ -858,7 +967,11 @@ Exemplos:
                 logger.info(f"{key}: {value}")
         logger.info("==================")
 
-        main(args.path_arquivos, args.path_base_contas, args.modelo, dry_run=args.dry_run, timeout=args.timeout, reclassificar=args.reclassificar)
+        if args.arquivo is not None:
+            stable_to = args.stable_timeout if args.stable_timeout is not None else CONFIG.get('stable_timeout', 15)
+            main_single_file(args.arquivo, args.path_base_contas, args.modelo, dry_run=args.dry_run, timeout=args.timeout, stable_timeout=stable_to)
+        else:
+            main(args.path_arquivos, args.path_base_contas, args.modelo, dry_run=args.dry_run, timeout=args.timeout, reclassificar=args.reclassificar)
         
     except KeyboardInterrupt:
         logger.info("Processamento interrompido pelo usuário")
